@@ -22,7 +22,11 @@
   Home:
     A: Adaptive   H: HR only   P: Power only
     1/2/3: manual requested level (not physically sent)
-    T: Test/status details   R: rescan saved sensors   B: browser
+    S: Settings   Z: zones   T: Test/status   R: reconnect   B: browser
+  Settings:
+    UP / DOWN: select field; ENTER: edit value; ENTER: save value
+    ESC while editing: cancel edit; otherwise: HOME
+    Z: zone preview (when not editing)
 
   BLE services:
     HR    0x180D, measurement 0x2A37
@@ -33,6 +37,7 @@
 #include <M5Cardputer.h>
 #include <NimBLEDevice.h>
 #include <Preferences.h>
+#include "cooling_math.h"
 #include <atomic>
 #include <string>
 #include <cstring>
@@ -51,8 +56,8 @@ constexpr uint32_t STALE_MS      = 7000;
 constexpr uint32_t UI_MS         = 200;
 constexpr uint32_t MIN_SWITCH_MS = 6000;
 constexpr uint32_t DOWN_HOLD_MS  = 20000;
-constexpr int HR_STAGE2 = 120, HR_STAGE3 = 150, HR_HYST = 8;
-constexpr int PWR_STAGE2 = 150, PWR_STAGE3 = 250, PWR_HYST = 20;
+constexpr int HR_HYST = 8;
+constexpr int PWR_HYST = 20;
 constexpr int MAX_DEVICES = 40;
 constexpr int PAGE_COUNT = 3;
 
@@ -131,10 +136,88 @@ static void powerNotify(NimBLERemoteCharacteristic*, uint8_t* p, size_t n, bool)
   powerMs.store(millis());
 }
 
-enum class Screen : uint8_t { Home, Browser, Test };
+struct CoolingConfig {
+  uint16_t restingHr = 49;
+  uint16_t maxHr = 199;
+  uint16_t ftp = 228;
+  uint16_t hr2Pct = 54;   // HRR: 49 + 150 * 54% => 130 bpm
+  uint16_t hr3Pct = 74;   // HRR: 49 + 150 * 74% => 160 bpm
+  uint16_t pw2Pct = 60;   // FTP: 228 * 60% => 137 W
+  uint16_t pw3Pct = 90;   // FTP: 228 * 90% => 206 W
+};
+CoolingConfig cooling;
+
+int hrStage2() { return CoolingMath::hrAtPercent(cooling.restingHr, cooling.maxHr, cooling.hr2Pct); }
+int hrStage3() { return CoolingMath::hrAtPercent(cooling.restingHr, cooling.maxHr, cooling.hr3Pct); }
+int powerStage2() { return CoolingMath::powerAtPercent(cooling.ftp, cooling.pw2Pct); }
+int powerStage3() { return CoolingMath::powerAtPercent(cooling.ftp, cooling.pw3Pct); }
+
+bool validConfig(const CoolingConfig& c) {
+  return c.restingHr >= 30 && c.restingHr <= 120 &&
+         c.maxHr >= 120 && c.maxHr <= 230 &&
+         c.maxHr > c.restingHr + 30 &&
+         c.ftp >= 50 && c.ftp <= 600 &&
+         c.hr2Pct >= 30 && c.hr3Pct <= 99 && c.hr2Pct + 5 <= c.hr3Pct &&
+         c.pw2Pct >= 20 && c.pw3Pct <= 200 && c.pw2Pct + 5 <= c.pw3Pct;
+}
+
+void loadCooling() {
+  CoolingConfig saved;
+  saved.restingHr = prefs.getUShort("resthr", 49);
+  saved.maxHr = prefs.getUShort("maxhr", 199);
+  saved.ftp = prefs.getUShort("ftp", 228);
+  saved.hr2Pct = prefs.getUShort("hr2pct", 54);
+  saved.hr3Pct = prefs.getUShort("hr3pct", 74);
+  saved.pw2Pct = prefs.getUShort("pw2pct", 60);
+  saved.pw3Pct = prefs.getUShort("pw3pct", 90);
+  cooling = validConfig(saved) ? saved : CoolingConfig{};
+}
+void saveCooling() {
+  prefs.putUShort("resthr", cooling.restingHr);
+  prefs.putUShort("maxhr", cooling.maxHr);
+  prefs.putUShort("ftp", cooling.ftp);
+  prefs.putUShort("hr2pct", cooling.hr2Pct);
+  prefs.putUShort("hr3pct", cooling.hr3Pct);
+  prefs.putUShort("pw2pct", cooling.pw2Pct);
+  prefs.putUShort("pw3pct", cooling.pw3Pct);
+}
+
+constexpr int SETTINGS_FIELDS = 7;
+const char* const settingLabels[SETTINGS_FIELDS] = {
+  "Resting HR", "Max HR", "FTP", "Fan2 HRR %", "Fan3 HRR %", "Fan2 FTP %", "Fan3 FTP %"
+};
+uint16_t getSetting(int i) {
+  switch (i) {
+    case 0: return cooling.restingHr;
+    case 1: return cooling.maxHr;
+    case 2: return cooling.ftp;
+    case 3: return cooling.hr2Pct;
+    case 4: return cooling.hr3Pct;
+    case 5: return cooling.pw2Pct;
+    default: return cooling.pw3Pct;
+  }
+}
+void setSetting(CoolingConfig& c, int i, uint16_t value) {
+  switch (i) {
+    case 0: c.restingHr = value; break;
+    case 1: c.maxHr = value; break;
+    case 2: c.ftp = value; break;
+    case 3: c.hr2Pct = value; break;
+    case 4: c.hr3Pct = value; break;
+    case 5: c.pw2Pct = value; break;
+    default: c.pw3Pct = value; break;
+  }
+}
+
+enum class Screen : uint8_t { Home, Browser, Test, Settings, Zones };
 enum class Mode : uint8_t { Adaptive, HR, Power, Manual };
 Screen screen = Screen::Home;
 Mode mode = Mode::Adaptive;
+int settingsSelected = 0;
+bool editingSetting = false;
+bool replaceOnNextDigit = false;
+String editBuffer;
+String settingsNotice = "ENTER to edit";
 int targetSensor = 0;  // 0 = HR, 1 = PWR
 String filterText;
 int selected = 0;
@@ -303,12 +386,8 @@ void connectSavedAfterScan() {
   }
 }
 
-// Cooling logic (fan output currently virtual).
-int stage(float v, int t2, int t3, int hyst, int previous) {
-  if (v >= t3 || (previous == 3 && v >= t3 - hyst)) return 3;
-  if (v >= t2 || (previous >= 2 && v >= t2 - hyst)) return 2;
-  return 1;
-}
+// Cooling logic (fan output currently virtual). Thresholds are calculated
+// from the editable settings and are not fixed in the source code.
 void fanRequest(int level) {
   if (level == requestedLevel) return;
   requestedLevel = level;
@@ -332,8 +411,8 @@ void updateCooling() {
     lastPowerTick = powerMs.load();
   }
   if (mode == Mode::Manual) return;
-  int a = h ? stage(hrSmoothed, HR_STAGE2, HR_STAGE3, HR_HYST, requestedLevel) : -1;
-  int b = p ? stage(powerSmoothed, PWR_STAGE2, PWR_STAGE3, PWR_HYST, requestedLevel) : -1;
+  int a = h ? CoolingMath::stage(hrSmoothed, hrStage2(), hrStage3(), HR_HYST, requestedLevel) : -1;
+  int b = p ? CoolingMath::stage(powerSmoothed, powerStage2(), powerStage3(), PWR_HYST, requestedLevel) : -1;
   int desired = -1;
   if (mode == Mode::HR) desired = a;
   if (mode == Mode::Power) desired = b;
@@ -371,16 +450,17 @@ void drawHome() {
   uint32_t now = millis();
   bool h = hrMs.load() && uint32_t(now - hrMs.load()) < STALE_MS;
   bool p = powerMs.load() && uint32_t(now - powerMs.load()) < STALE_MS;
-  line(2, "CARDIO54  Cardputer-Adv", TFT_CYAN);
+  line(2, "CARDIO54  ADV - V0.2", TFT_CYAN);
   line(19, String("HR    ") + (h ? String(hrValue.load()) + " bpm" : "-- bpm") +
        (isConnected(0) ? "  [BLE]" : "  [--]"));
   line(35, String("POWER ") + (p ? String(powerValue.load()) + " W" : "-- W") +
        (isConnected(1) ? "  [BLE]" : "  [--]"));
   line(52, String("MODE: ") + modeName() + "  TARGET: " + requestedLevel + "/3", TFT_GREEN);
   line(68, "RF OUTPUT: DISABLED (test)", TFT_YELLOW);
-  line(82, compact(statusText, 37), TFT_LIGHTGREY);
-  line(104, "B:BLE  T:TEST  R:RECONNECT", TFT_WHITE);
-  line(119, "A/H/P:auto     1/2/3:manual", TFT_WHITE);
+  line(82, "HR " + String(hrStage2()) + "/" + hrStage3() +
+       " bpm   PWR " + powerStage2() + "/" + powerStage3() + "W", TFT_LIGHTGREY);
+  line(103, "S:SETTINGS Z:ZONES B:BLE T:TEST", TFT_WHITE);
+  line(119, "A/H/P:MODE  1/2/3:MAN R:BLE", TFT_WHITE);
 }
 void drawBrowser() {
   FoundDevice snapshot[MAX_DEVICES];
@@ -420,9 +500,72 @@ void drawTest() {
     String val = fresh ? String(i == 0 ? hrValue.load() : powerValue.load()) : "WAITING";
     line(y + 24, String(i == 0 ? "Heart rate: " : "Power: ") + val + (fresh ? (i == 0 ? " bpm" : " W") : ""));
   }
-  line(109, compact(statusText, 36), TFT_YELLOW);
-  line(123, "Fn+` HOME   TAB BLE BROWSER", TFT_WHITE);
+  bool anyFresh = (hrMs.load() && uint32_t(now - hrMs.load()) < STALE_MS) ||
+                  (powerMs.load() && uint32_t(now - powerMs.load()) < STALE_MS);
+  line(109, anyFresh ? "Receiving sensor data" : compact(statusText, 36), TFT_YELLOW);
+  line(123, "ESC HOME  TAB BLE BROWSER", TFT_WHITE);
 }
+void drawSettings() {
+  line(2, "SETTINGS  (stored in flash)", TFT_CYAN);
+  int first = (settingsSelected / 5) * 5;
+  for (int row = 0; row < 5 && (first + row) < SETTINGS_FIELDS; ++row) {
+    int i = first + row;
+    String value = (editingSetting && i == settingsSelected) ? editBuffer + "_" : String(getSetting(i));
+    String suffix = (i == 0 || i == 1) ? " bpm" : (i == 2 ? " W" : "%");
+    line(19 + row * 17, String(i == settingsSelected ? ">" : " ") +
+         settingLabels[i] + ": " + value + suffix,
+         i == settingsSelected ? TFT_GREEN : TFT_WHITE);
+  }
+  line(109, compact(settingsNotice, 38), TFT_YELLOW);
+  line(122, editingSetting ? "Digits  ENTER:SAVE  ESC:CANCEL" : "UP/DOWN ENTER:EDIT Z:ZONES ESC", TFT_WHITE);
+}
+
+void drawZones() {
+  line(2, "CYCLING ZONES (% HRR)", TFT_CYAN);
+  const int pct[] = {34, 47, 60, 73, 87, 100};
+  const char* labels[] = {"Z1", "Z2", "Z3", "Z4", "Z5"};
+  for (int i = 0; i < 5; ++i) {
+    int start = CoolingMath::hrAtPercent(cooling.restingHr, cooling.maxHr, pct[i]);
+    int end = CoolingMath::hrAtPercent(cooling.restingHr, cooling.maxHr, pct[i+1]) - 1;
+    if (i == 4) end = cooling.maxHr;
+    line(17 + 15*i, String(labels[i]) + ": " + pct[i] + "-" + pct[i+1] +
+         "% = " + start + "-" + end + " bpm", TFT_WHITE);
+  }
+  line(96, "FAN: HR " + String(hrStage2()) + "/" + hrStage3() + " bpm", TFT_GREEN);
+  line(109, "FAN: PWR " + String(powerStage2()) + "/" + powerStage3() + " W", TFT_GREEN);
+  line(122, "S:SETTINGS   ESC:HOME", TFT_WHITE);
+}
+
+void settingsEnter() {
+  if (!editingSetting) {
+    editBuffer = String(getSetting(settingsSelected));
+    editingSetting = true;
+    replaceOnNextDigit = true;
+    settingsNotice = "Type to replace, ENTER saves";
+    return;
+  }
+  if (editBuffer.length() == 0) {
+    settingsNotice = "Please enter a number";
+    return;
+  }
+  long number = editBuffer.toInt();
+  if (number < 1 || number > 1000) {
+    settingsNotice = "Value out of range";
+    return;
+  }
+  CoolingConfig proposed = cooling;
+  setSetting(proposed, settingsSelected, static_cast<uint16_t>(number));
+  if (!validConfig(proposed)) {
+    settingsNotice = "Invalid values or order";
+    return;
+  }
+  cooling = proposed;
+  saveCooling();
+  pendingLevel = -1;  // recompute using the updated thresholds
+  editingSetting = false;
+  settingsNotice = "Saved. Thresholds updated";
+}
+
 void drawUI() {
   auto& d = M5Cardputer.Display;
   d.fillScreen(TFT_BLACK);
@@ -431,7 +574,9 @@ void drawUI() {
   d.setTextWrap(false);
   if (screen == Screen::Home) drawHome();
   else if (screen == Screen::Browser) drawBrowser();
-  else drawTest();
+  else if (screen == Screen::Test) drawTest();
+  else if (screen == Screen::Settings) drawSettings();
+  else drawZones();
 }
 
 void browserEnter() {
@@ -451,6 +596,48 @@ void processKeyboard() {
   M5Cardputer.update();
   if (!M5Cardputer.Keyboard.isChange() || !M5Cardputer.Keyboard.isPressed()) return;
   Keyboard_Class::KeysState keys = M5Cardputer.Keyboard.keysState();
+  if (screen == Screen::Settings) {
+    if (keys.esc) {
+      if (editingSetting) {
+        editingSetting = false;
+        settingsNotice = "Edit cancelled";
+      } else {
+        screen = Screen::Home;
+      }
+      return;
+    }
+    if (editingSetting) {
+      if (keys.enter) { settingsEnter(); return; }
+      if (keys.del || keys.backspace) {
+        replaceOnNextDigit = false;
+        if (!editBuffer.isEmpty()) editBuffer.remove(editBuffer.length()-1);
+        return;
+      }
+      if (!keys.fn && !keys.ctrl && !keys.alt) {
+        for (char ch : keys.word) {
+          if (ch >= '0' && ch <= '9' && editBuffer.length() < 4) {
+            if (replaceOnNextDigit) { editBuffer = ""; replaceOnNextDigit = false; }
+            editBuffer += ch;
+          }
+        }
+      }
+      return;
+    }
+    if (keys.up) { settingsSelected = max(0, settingsSelected-1); return; }
+    if (keys.down) { settingsSelected = min(SETTINGS_FIELDS-1, settingsSelected+1); return; }
+    if (keys.enter) { settingsEnter(); return; }
+    for (char ch : keys.word) {
+      if (ch == 'z' || ch == 'Z') { screen = Screen::Zones; return; }
+    }
+    return;
+  }
+  if (screen == Screen::Zones) {
+    if (keys.esc) { screen = Screen::Home; return; }
+    for (char ch : keys.word) {
+      if (ch == 's' || ch == 'S') { screen = Screen::Settings; return; }
+    }
+    return;
+  }
   if (keys.esc) { screen = Screen::Home; return; }
 
   if (screen == Screen::Browser) {
@@ -492,6 +679,8 @@ void processKeyboard() {
         startScan(false);
         return;
       case 't': case 'T': screen = Screen::Test; return;
+      case 's': case 'S': screen = Screen::Settings; return;
+      case 'z': case 'Z': screen = Screen::Zones; return;
       case 'r': case 'R':
         startScan(true); return;
       case 'a': case 'A': mode = Mode::Adaptive; pendingLevel = -1; break;
@@ -511,6 +700,7 @@ void setup() {
   M5Cardputer.begin(cfg, true);  // enable keyboard
   M5Cardputer.Display.setRotation(1);
   loadPreferred();
+  loadCooling();
   NimBLEDevice::init("Cardio54-Controller");
   NimBLEScan* scan = NimBLEDevice::getScan();
   scan->setScanCallbacks(&browserCallbacks, false);

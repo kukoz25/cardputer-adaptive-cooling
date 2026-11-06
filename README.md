@@ -1,144 +1,102 @@
-# Cardputer Adaptive Cooling
+# Cardputer Adaptive Cooling (prototype v0.2)
 
-An open-source smart fan controller for indoor cycling, built for the M5Stack Cardputer-Adv.
+A smart cooling controller for indoor cycling on an **M5Stack Cardputer-Adv**.
+The application reads heart rate from a BLE sensor (e.g. Polar H10) and power from a BLE trainer (e.g. Wahoo KICKR CORE), then computes a requested 3-speed fan level.
 
-The project automatically adjusts fan speed based on heart rate and cycling power, using a control algorithm inspired by the Wahoo KICKR HEADWIND.
+**Important:** This firmware does **not** transmit RF, and it cannot yet control the Vacmaster Cardio54. The CC1101 module is intentionally not initialized. The fan output is simulated on screen and printed over Serial. Radio commands can be implemented after obtaining and testing the original remote signals.
 
-## Features
+## Implemented features
 
-- Bluetooth Low Energy (BLE) support for heart rate and power sensors
-- Automatic Bluetooth device discovery and selection
-- Manual device name search using the Cardputer keyboard
-- Support for simultaneous heart rate and power monitoring
-- Automatic heart rate zone calculation using resting and maximum heart rate
-- Power zone calculation based on Functional Threshold Power (FTP)
-- Adaptive cooling based on both heart rate and cycling power
-- Three fan speed levels
-- Manual and automatic operating modes
-- Configurable thresholds and user settings
-- Persistent device and user configuration
-- CC1101 radio module support for fan control
-- Compatibility with M5Launcher
-- Automated firmware builds using GitHub Actions
-
-Some features are planned or under development. The current prototype focuses on BLE connectivity and sensor monitoring.
+- Scan and filter nearby Bluetooth LE devices by advertised name or MAC address.
+- Choose sensors independently for HR and power, verify GATT service and subscribe to notifications.
+- Remember sensor addresses in flash and attempt to reconnect after restart.
+- Show live HR and power data, including connection and freshness indicators.
+- Settings screen with editable resting HR, maximum HR, FTP and four fan thresholds (%HRR and %FTP).
+- Calculate the five Garmin-style cycling HRR bands (34–47, 47–60, 60–73, 73–87, 87–100%) and show them on the device.
+- Automatically convert %HRR into bpm and %FTP into watts. Settings are saved using ESP32 Preferences (NVS).
+- Adaptive mode picks the higher fan demand from HR and power; HR-only, power-only and manual modes also exist.
+- Smooth sensor data, apply threshold hysteresis, minimum switch interval and delayed downshifts.
 
 ## Hardware
 
-The project is designed for the following hardware:
+- M5Stack Cardputer-Adv
+- Official M5Stack Cap CC1101 (not used yet)
+- Polar H10 or other standard Bluetooth Heart Rate Service sensor
+- Wahoo KICKR CORE or other standard Cycling Power Service sensor
 
-| Component | Device |
-|---|---|
-| Controller | M5Stack Cardputer-Adv |
-| Radio module | Official M5Stack Cap CC1101 |
-| Heart rate sensor | Polar H10 |
-| Smart trainer | Wahoo KICKR CORE |
-| Fan | Vacmaster Cardio54 |
+The Cardputer subscribes to `0x180D/0x2A37` for HR and `0x1818/0x2A63` for cycling power. It does not control trainer resistance; Zwift can remain the resistance controller.
 
-Other BLE heart rate sensors and power meters may also work if they support standard Bluetooth services.
+## Keyboard shortcuts
 
-## How It Works
+| Screen | Key | Action |
+| --- | --- | --- |
+| Home | S | Settings |
+| Home | Z | HR zones and calculated fan thresholds |
+| Home | B | Bluetooth scan / sensor chooser |
+| Home | T | Sensor data test |
+| Home | R | Reconnect saved sensors |
+| Home | A / H / P | Adaptive / HR / Power mode |
+| Home | 1 / 2 / 3 | Set simulated fan level manually |
+| Settings | Up / Down (Fn+; / Fn+.) | Select field |
+| Settings | Enter | Edit selected field; Enter again saves |
+| Settings (editing) | Digits, Backspace | Change numeric value |
+| Settings (editing) | Esc | Cancel edit |
+| Settings | Z | Show calculated zones |
+| Browser | Tab | Switch HR / POWER sensor slot |
+| Browser | Type text | Filter by name/MAC |
+| Browser | Up / Down, Enter | Select and connect |
+| Browser | Fn + Enter | Scan again |
+| Test | Tab | Open BLE browser |
+| Other screens | Esc (Fn+`) | Return Home |
 
-The Cardputer connects to a heart rate monitor and a cycling power meter over Bluetooth.
+Names of physical modifier keys may depend on keyboard mapping and library firmware.
 
-It continuously reads both measurements and calculates the required cooling intensity.
+## Default configuration
 
-The fan speed is determined by whichever measurement requires more cooling.
+| Variable | Default |
+| --- | ---: |
+| Resting HR | 49 bpm |
+| Max HR | 199 bpm |
+| FTP | 228 W |
+| Fan 2 threshold (HRR) | 54% = 130 bpm |
+| Fan 3 threshold (HRR) | 74% = 160 bpm |
+| Fan 2 threshold (FTP) | 60% = 137 W |
+| Fan 3 threshold (FTP) | 90% = 206 W |
 
-For example:
+For example, with 150 bpm and 210 W, adaptive mode chooses the higher requested fan level: **3**. The displayed speed is virtual until RF is added. The HRR band boundaries come from the user's Garmin cycling profile; they are not universal training-zone defaults.
 
-- Low heart rate and low power: Fan speed 1
-- Moderate heart rate or power: Fan speed 2
-- High heart rate or power: Fan speed 3
-
-This allows the fan to respond quickly to power increases during intervals while maintaining airflow when heart rate remains elevated during recovery.
-
-The controller sends wireless commands to the fan using the CC1101 radio module.
-
-RF transmission requires capturing and validating the original fan remote control signals. This functionality is not yet implemented in the prototype.
-
-## User Configuration
-
-Users can configure their own physiological parameters directly on the Cardputer:
-
-- Resting heart rate (bpm)
-- Maximum heart rate (bpm)
-- Functional Threshold Power (FTP, watts)
-
-The application will automatically calculate heart rate reserve (HRR), heart rate zones, and power-based cooling thresholds.
-
-All thresholds can be adjusted manually.
-
-## Bluetooth Connectivity
-
-The application supports scanning for nearby Bluetooth devices, filtering devices by name, selecting sensors using the Cardputer keyboard, and saving device selections.
-
-Supported Bluetooth services include:
-
-- Heart Rate Service (0x180D)
-- Cycling Power Service (0x1818)
-
-The controller only reads data from the smart trainer. It does not control resistance or interfere with applications such as Zwift.
-
-## Building the Firmware
-
-The project uses PlatformIO and the Arduino framework.
-
-Requirements:
-
-- Visual Studio Code with the PlatformIO extension, or PlatformIO CLI
-- ESP32-S3 development platform
-- M5Cardputer library
-- NimBLE-Arduino library
-
-To build the firmware:
+## Compile using PlatformIO
 
 ```bash
+python -m pip install platformio
 pio run -e cardputer_adv
 ```
 
-The compiled firmware is generated at:
-
-```text
-.pio/build/cardputer_adv/firmware.bin
-```
-
-## Installing with M5Launcher
-
-1. Download the latest firmware from GitHub Releases.
-2. Copy the `.bin` file to the Cardputer microSD card.
-3. Open M5Launcher.
-4. Select the firmware file from the SD card.
-5. Install and launch the application.
-
-Firmware compatibility with M5Launcher must be verified on the Cardputer-Adv hardware.
+Output: `.pio/build/cardputer_adv/firmware.bin`. Builds using the configuration in `platformio.ini`. Copy the `.bin` onto a microSD card and install it through M5Launcher. Device-side testing on Cardputer-Adv is required before declaring a build fully compatible.
 
 ## GitHub Actions
 
-The repository includes an automated build pipeline.
+Workflow: `.github/workflows/firmware.yml`
 
-Every push and pull request triggers a firmware compilation.
+- Push to `main` or open a PR to compile and publish a downloadable workflow artifact.
+- Push a new `v*` tag (for example `v0.2.0`) to compile and attach `Cardio54-Cardputer-ADV.bin` to that GitHub Release.
+- Do not reuse the existing `v0.1.0` tag for new code.
 
-Successful builds produce a downloadable `.bin` artifact.
+## Run arithmetic tests locally
 
-Pushing a version tag such as `v0.1.0` automatically creates a GitHub Release containing the compiled firmware.
+```bash
+g++ -std=c++17 -I include tests/test_cooling_math.cpp -o /tmp/cardio-math-test
+/tmp/cardio-math-test
+```
 
-## Development Status
+## Planned next steps
 
-The project is currently under development.
+1. Validate the Settings screen and dual BLE operation with Zwift running.
+2. Capture original Vacmaster remote control signals using Bruce and CC1101 when the fan arrives.
+3. Identify protocol/modulation and check if replay is supported.
+4. Implement an opt-in RF transmitter and test each button independently.
 
-The initial prototype provides BLE sensor discovery, connection management, and heart rate and power monitoring.
+## Sources
 
-Planned development includes:
-
-- User-editable HR and FTP settings
-- Automatic zone calculation
-- Improved adaptive cooling with hysteresis and signal filtering
-- CC1101 remote signal playback
-- Complete fan control
-- Improved user interface and diagnostics
-- Hardware testing and validation
-
-## License
-
-License to be determined.
+- [Cardputer-Adv documentation](https://docs.m5stack.com/en/core/Cardputer-Adv)
+- [Cap CC1101 pinout](https://docs.m5stack.com/en/cap/Cap_CC1101)
