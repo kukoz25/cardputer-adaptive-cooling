@@ -698,7 +698,7 @@ void setup() {
   Serial.begin(115200);
   auto cfg = M5.config();
   M5Cardputer.begin(cfg, true);  // enable keyboard
-  M5Cardputer.Display.setRotation(1);
+  M5Cardputer.Display.setRotation(0);
   loadPreferred();
   loadCooling();
   NimBLEDevice::init("Cardio54-Controller");
