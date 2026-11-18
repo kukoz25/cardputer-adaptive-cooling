@@ -30,6 +30,10 @@ Press `M` on Home to switch profiles. The Cardputer remembers your selection.
 
 The app only subscribes to measurements. Zwift can continue controlling trainer resistance. Treadmill running uses heart rate. Pace, WalkingPad, and QZ inputs are currently unavailable.
 
+### Automatic speed reductions
+
+Open Settings with `S` and edit `Downshift delay` to change how long a lower fan speed must be requested before the fan slows down. The setting is shared by both activity profiles and defaults to 20 seconds. Enter 0 to skip this delay. Speed reductions still respect the 6-second interval between command attempts.
+
 ### Auto-off during cycling
 
 In automatic cycling modes, the app turns off a fan it has started once the trainer has reported a continuous **20 seconds at 0 W**. A gap or disconnect does not count as zero power. Start pedaling again to resume cooling. The timer is inactive in manual control and treadmill running.

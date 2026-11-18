@@ -15,7 +15,6 @@ constexpr uint32_t SCAN_MS       = 8000;
 constexpr uint32_t STALE_MS      = 7000;
 constexpr uint32_t UI_MS         = 200;
 constexpr uint32_t MIN_SWITCH_MS = 6000;
-constexpr uint32_t DOWN_HOLD_MS  = 20000;
 constexpr int HR_HYST = 8;
 constexpr int PWR_HYST = 20;
 constexpr int MAX_DEVICES = 40;
@@ -123,6 +122,7 @@ struct CoolingConfig {
   uint16_t pw2Pct = 60;
   uint16_t pw3Pct = 90;
   uint16_t zeroOffSeconds = 20;
+  uint16_t downshiftSeconds = 20;
   uint16_t runMaxHr = 199;
   uint16_t runHr2Pct = 54;
   uint16_t runHr3Pct = 74;
@@ -151,7 +151,7 @@ bool validConfig(const CoolingConfig& c) {
          validHrProfile(c.restingHr, c.runMaxHr, c.runHr2Pct, c.runHr3Pct) &&
          c.ftp >= 50 && c.ftp <= 600 && c.pw2Pct >= 20 &&
          c.pw3Pct <= 200 && c.pw2Pct + 5 <= c.pw3Pct &&
-         c.zeroOffSeconds <= 600;
+         c.zeroOffSeconds <= 600 && c.downshiftSeconds <= 600;
 }
 
 struct Setting {
@@ -169,12 +169,13 @@ constexpr Setting settings[] = {
   {"pw2pct", "Fan 2 FTP", "%", &CoolingConfig::pw2Pct},
   {"pw3pct", "Fan 3 FTP", "%", &CoolingConfig::pw3Pct},
   {"zerooff", "Stop at 0 W", " s", &CoolingConfig::zeroOffSeconds},
+  {"downshift", "Downshift delay", " s", &CoolingConfig::downshiftSeconds},
   {"runmaxhr", "Run max HR", " bpm", &CoolingConfig::runMaxHr},
   {"runhr2pct", "Run fan 2 HRR", "%", &CoolingConfig::runHr2Pct},
   {"runhr3pct", "Run fan 3 HRR", "%", &CoolingConfig::runHr3Pct},
 };
-constexpr int CyclingSettingCount = 8;
-constexpr int TreadmillSettings[] = {0, 8, 9, 10};
+constexpr int CyclingSettingCount = 9;
+constexpr int TreadmillSettings[] = {0, 9, 10, 11, 8};
 
 int settingsCount() {
   return cycling() ? CyclingSettingCount : sizeof(TreadmillSettings) / sizeof(int);
@@ -458,8 +459,9 @@ void updateCooling() {
   if (cycling() && mode == Mode::Adaptive) desired = max(hrDemand, powerDemand);
   if (desired < 1 || desired == requestedLevel) { pendingLevel = -1; return; }
   if (pendingLevel != desired) { pendingLevel = desired; pendingSince = now; }
+  const uint32_t downshiftDelayMs = cooling.downshiftSeconds * 1000UL;
   if ((canSend || (requestedLevel == 0 && lastButton == 0)) &&
-      (desired > requestedLevel || now - pendingSince >= DOWN_HOLD_MS)) {
+      (desired > requestedLevel || now - pendingSince >= downshiftDelayMs)) {
     fanRequest(desired);
   }
 }
