@@ -1,55 +1,15 @@
-/*
-  Cardio54 Controller - Cardputer-Adv BLE scanner + Polar H10 + Wahoo KICKR CORE
-  Hardware: M5Stack Cardputer-Adv with official Cap CC1101 (U219).
-
-  Dependencies:
-    - M5Cardputer 1.1.0+ (M5Unified and M5GFX dependencies)
-    - NimBLE-Arduino 2.x (API checked against 2.x documentation)
-  Board: M5Stack -> M5Cardputer (board package >= 3.2.2)
-
-  This is a BLE and cooling-logic TEST firmware. There is NO RF transmission
-  until we obtain legitimate pilot captures and verify the RF protocol.
-
-  Browser:
-    Home B: BLE browser (new scan)
-    Browser TAB: choose HR / PWR target
-    Type: filter advertised names/addresses (not a Bluetooth pairing PIN)
-    Fn + ; : UP     Fn + . : DOWN
-    ENTER: connect and verify required GATT service + notification
-    Fn + ENTER: scan again
-    Fn + ` (ESC): back home
-
-  Home:
-    A: Adaptive   H: HR only   P: Power only
-    1/2/3: manual requested level (not physically sent)
-    S: Settings   Z: zones   T: Test/status   R: reconnect   B: browser
-  Settings:
-    UP / DOWN: select field; ENTER: edit value; ENTER: save value
-    ESC while editing: cancel edit; otherwise: HOME
-    Z: zone preview (when not editing)
-
-  BLE services:
-    HR    0x180D, measurement 0x2A37
-    Power 0x1818, measurement 0x2A63
-*/
-
+// Cardputer-Adv cooling controller for indoor cycling and treadmill running.
 #include <Arduino.h>
 #include <M5Cardputer.h>
 #include <NimBLEDevice.h>
 #include <Preferences.h>
 #include "cooling_math.h"
+#include "fan_radio.h"
+#include "zero_power.h"
 #include <atomic>
 #include <string>
 #include <cstring>
 #include <cctype>
-
-// Official Cap CC1101 mapping (reserved, not used until we add RF replay).
-constexpr int PIN_CC1101_CS    = 5;
-constexpr int PIN_CC1101_GDO0  = 15;
-constexpr int PIN_CC1101_RFSW0 = 13;
-constexpr int PIN_CAP_SCK      = 40;
-constexpr int PIN_CAP_MOSI     = 14;
-constexpr int PIN_CAP_MISO     = 39;
 
 constexpr uint32_t SCAN_MS       = 8000;
 constexpr uint32_t STALE_MS      = 7000;
@@ -114,9 +74,22 @@ Preferences prefs;
 NimBLEClient* clients[2] = {nullptr, nullptr};
 
 std::atomic<int> hrValue{-1};
-std::atomic<int> powerValue{-1};
 std::atomic<uint32_t> hrMs{0};
-std::atomic<uint32_t> powerMs{0};
+portMUX_TYPE powerMux = portMUX_INITIALIZER_UNLOCKED;
+PowerSample powerSample;
+
+PowerSample readPower() {
+  portENTER_CRITICAL(&powerMux);
+  const PowerSample sample = powerSample;
+  portEXIT_CRITICAL(&powerMux);
+  return sample;
+}
+
+void clearPower() {
+  portENTER_CRITICAL(&powerMux);
+  powerSample = {};
+  portEXIT_CRITICAL(&powerMux);
+}
 
 static void hrNotify(NimBLERemoteCharacteristic*, uint8_t* p, size_t n, bool) {
   if (n < 2) return;
@@ -132,81 +105,93 @@ static void powerNotify(NimBLERemoteCharacteristic*, uint8_t* p, size_t n, bool)
   if (n < 4) return;
   // Cycling Power Measurement flags=uint16, instantaneous power=int16, LE.
   int16_t v = (int16_t)(uint16_t(p[2]) | (uint16_t(p[3]) << 8));
-  powerValue.store(v < 0 ? 0 : int(v));
-  powerMs.store(millis());
+  portENTER_CRITICAL(&powerMux);
+  powerSample.record(v, millis(), STALE_MS);
+  portEXIT_CRITICAL(&powerMux);
 }
+
+enum class Activity : uint8_t { Cycling, Treadmill };
+Activity activity = Activity::Cycling;
+bool cycling() { return activity == Activity::Cycling; }
 
 struct CoolingConfig {
   uint16_t restingHr = 49;
   uint16_t maxHr = 199;
   uint16_t ftp = 228;
-  uint16_t hr2Pct = 54;   // HRR: 49 + 150 * 54% => 130 bpm
-  uint16_t hr3Pct = 74;   // HRR: 49 + 150 * 74% => 160 bpm
-  uint16_t pw2Pct = 60;   // FTP: 228 * 60% => 137 W
-  uint16_t pw3Pct = 90;   // FTP: 228 * 90% => 206 W
+  uint16_t hr2Pct = 54;
+  uint16_t hr3Pct = 74;
+  uint16_t pw2Pct = 60;
+  uint16_t pw3Pct = 90;
+  uint16_t zeroOffSeconds = 20;
+  uint16_t runMaxHr = 199;
+  uint16_t runHr2Pct = 54;
+  uint16_t runHr3Pct = 74;
 };
 CoolingConfig cooling;
 
-int hrStage2() { return CoolingMath::hrAtPercent(cooling.restingHr, cooling.maxHr, cooling.hr2Pct); }
-int hrStage3() { return CoolingMath::hrAtPercent(cooling.restingHr, cooling.maxHr, cooling.hr3Pct); }
+int activeMaxHr() { return cycling() ? cooling.maxHr : cooling.runMaxHr; }
+int hrStage2() {
+  return CoolingMath::hrAtPercent(cooling.restingHr, activeMaxHr(),
+                                 cycling() ? cooling.hr2Pct : cooling.runHr2Pct);
+}
+int hrStage3() {
+  return CoolingMath::hrAtPercent(cooling.restingHr, activeMaxHr(),
+                                 cycling() ? cooling.hr3Pct : cooling.runHr3Pct);
+}
 int powerStage2() { return CoolingMath::powerAtPercent(cooling.ftp, cooling.pw2Pct); }
 int powerStage3() { return CoolingMath::powerAtPercent(cooling.ftp, cooling.pw3Pct); }
 
+bool validHrProfile(int rest, int maxHr, int stage2, int stage3) {
+  return maxHr >= 120 && maxHr <= 230 && maxHr > rest + 30 &&
+         stage2 >= 30 && stage3 <= 99 && stage2 + 5 <= stage3;
+}
 bool validConfig(const CoolingConfig& c) {
   return c.restingHr >= 30 && c.restingHr <= 120 &&
-         c.maxHr >= 120 && c.maxHr <= 230 &&
-         c.maxHr > c.restingHr + 30 &&
-         c.ftp >= 50 && c.ftp <= 600 &&
-         c.hr2Pct >= 30 && c.hr3Pct <= 99 && c.hr2Pct + 5 <= c.hr3Pct &&
-         c.pw2Pct >= 20 && c.pw3Pct <= 200 && c.pw2Pct + 5 <= c.pw3Pct;
+         validHrProfile(c.restingHr, c.maxHr, c.hr2Pct, c.hr3Pct) &&
+         validHrProfile(c.restingHr, c.runMaxHr, c.runHr2Pct, c.runHr3Pct) &&
+         c.ftp >= 50 && c.ftp <= 600 && c.pw2Pct >= 20 &&
+         c.pw3Pct <= 200 && c.pw2Pct + 5 <= c.pw3Pct &&
+         c.zeroOffSeconds <= 600;
+}
+
+struct Setting {
+  const char* key;
+  const char* label;
+  const char* unit;
+  uint16_t CoolingConfig::*value;
+};
+constexpr Setting settings[] = {
+  {"resthr", "Resting HR", " bpm", &CoolingConfig::restingHr},
+  {"maxhr", "Max HR", " bpm", &CoolingConfig::maxHr},
+  {"ftp", "FTP", " W", &CoolingConfig::ftp},
+  {"hr2pct", "Fan 2 HRR", "%", &CoolingConfig::hr2Pct},
+  {"hr3pct", "Fan 3 HRR", "%", &CoolingConfig::hr3Pct},
+  {"pw2pct", "Fan 2 FTP", "%", &CoolingConfig::pw2Pct},
+  {"pw3pct", "Fan 3 FTP", "%", &CoolingConfig::pw3Pct},
+  {"zerooff", "Stop at 0 W", " s", &CoolingConfig::zeroOffSeconds},
+  {"runmaxhr", "Run max HR", " bpm", &CoolingConfig::runMaxHr},
+  {"runhr2pct", "Run fan 2 HRR", "%", &CoolingConfig::runHr2Pct},
+  {"runhr3pct", "Run fan 3 HRR", "%", &CoolingConfig::runHr3Pct},
+};
+constexpr int CyclingSettingCount = 8;
+constexpr int TreadmillSettings[] = {0, 8, 9, 10};
+
+int settingsCount() {
+  return cycling() ? CyclingSettingCount : sizeof(TreadmillSettings) / sizeof(int);
+}
+
+const Setting& settingAt(int index) {
+  return settings[cycling() ? index : TreadmillSettings[index]];
 }
 
 void loadCooling() {
   CoolingConfig saved;
-  saved.restingHr = prefs.getUShort("resthr", 49);
-  saved.maxHr = prefs.getUShort("maxhr", 199);
-  saved.ftp = prefs.getUShort("ftp", 228);
-  saved.hr2Pct = prefs.getUShort("hr2pct", 54);
-  saved.hr3Pct = prefs.getUShort("hr3pct", 74);
-  saved.pw2Pct = prefs.getUShort("pw2pct", 60);
-  saved.pw3Pct = prefs.getUShort("pw3pct", 90);
+  for (const auto& setting : settings) {
+    auto& value = saved.*(setting.value);
+    value = prefs.getUShort(setting.key, value);
+  }
   cooling = validConfig(saved) ? saved : CoolingConfig{};
-}
-void saveCooling() {
-  prefs.putUShort("resthr", cooling.restingHr);
-  prefs.putUShort("maxhr", cooling.maxHr);
-  prefs.putUShort("ftp", cooling.ftp);
-  prefs.putUShort("hr2pct", cooling.hr2Pct);
-  prefs.putUShort("hr3pct", cooling.hr3Pct);
-  prefs.putUShort("pw2pct", cooling.pw2Pct);
-  prefs.putUShort("pw3pct", cooling.pw3Pct);
-}
-
-constexpr int SETTINGS_FIELDS = 7;
-const char* const settingLabels[SETTINGS_FIELDS] = {
-  "Resting HR", "Max HR", "FTP", "Fan2 HRR %", "Fan3 HRR %", "Fan2 FTP %", "Fan3 FTP %"
-};
-uint16_t getSetting(int i) {
-  switch (i) {
-    case 0: return cooling.restingHr;
-    case 1: return cooling.maxHr;
-    case 2: return cooling.ftp;
-    case 3: return cooling.hr2Pct;
-    case 4: return cooling.hr3Pct;
-    case 5: return cooling.pw2Pct;
-    default: return cooling.pw3Pct;
-  }
-}
-void setSetting(CoolingConfig& c, int i, uint16_t value) {
-  switch (i) {
-    case 0: c.restingHr = value; break;
-    case 1: c.maxHr = value; break;
-    case 2: c.ftp = value; break;
-    case 3: c.hr2Pct = value; break;
-    case 4: c.hr3Pct = value; break;
-    case 5: c.pw2Pct = value; break;
-    default: c.pw3Pct = value; break;
-  }
+  activity = prefs.getBool("treadmill", false) ? Activity::Treadmill : Activity::Cycling;
 }
 
 enum class Screen : uint8_t { Home, Browser, Test, Settings, Zones };
@@ -222,10 +207,12 @@ int targetSensor = 0;  // 0 = HR, 1 = PWR
 String filterText;
 int selected = 0;
 String statusText = "Ready. B = scan BLE";
-int requestedLevel = 1;  // virtual until RF implementation
+int requestedLevel = -1;  // The fan provides no feedback.
+bool cyclingPaused = false;
+int lastButton = -1;
+uint32_t lastAttempt = 0;
 int pendingLevel = -1;
 uint32_t pendingSince = 0;
-uint32_t lastSwitch = 0;
 uint32_t lastUi = 0;
 uint32_t lastHrTick = 0;
 uint32_t lastPowerTick = 0;
@@ -314,8 +301,13 @@ bool connectFound(int sensor, const FoundDevice& device, bool save) {
     NimBLEDevice::deleteClient(clients[sensor]);
     clients[sensor] = nullptr;
   }
-  hrMs.store(sensor == 0 ? 0 : hrMs.load());
-  powerMs.store(sensor == 1 ? 0 : powerMs.load());
+  if (sensor == 0) {
+    hrMs.store(0);
+    hrSmoothed = -1;
+  } else {
+    clearPower();
+    powerSmoothed = -1;
+  }
   statusText = String("Connecting ") + (sensor == 0 ? "HR" : "PWR") + "...";
   Serial.printf("CONNECT %s name=%s address=%s type=%u\n",
                 sensor == 0 ? "HR" : "PWR", device.name,
@@ -373,7 +365,7 @@ void connectSavedAfterScan() {
   scanForSaved = false;
   FoundDevice snapshot[MAX_DEVICES];
   int n = snapshotDevices(snapshot);
-  for (int sensor = 0; sensor < 2; ++sensor) {
+  for (int sensor = 0; sensor < (cycling() ? 2 : 1); ++sensor) {
     if (isConnected(sensor)) continue;
     int idx = findSaved(snapshot, n, sensor);
     if (idx >= 0) {
@@ -386,41 +378,88 @@ void connectSavedAfterScan() {
   }
 }
 
-// Cooling logic (fan output currently virtual). Thresholds are calculated
-// from the editable settings and are not fixed in the source code.
-void fanRequest(int level) {
-  if (level == requestedLevel) return;
-  requestedLevel = level;
-  lastSwitch = millis();
+void switchActivity() {
+  activity = cycling() ? Activity::Treadmill : Activity::Cycling;
+  prefs.putBool("treadmill", !cycling());
+  mode = cycling() ? Mode::Adaptive : Mode::HR;
+  settingsSelected = 0;
+  targetSensor = 0;
   pendingLevel = -1;
-  // TODO: send real RF when Vacmaster remote captures and semantics are known.
-  Serial.printf("[VIRTUAL FAN; CC1101 NOT TRANSMITTING] request level %d\n", level);
-}
-void updateCooling() {
-  uint32_t now = millis();
-  bool h = hrMs.load() && (uint32_t)(now - hrMs.load()) < STALE_MS;
-  bool p = powerMs.load() && (uint32_t)(now - powerMs.load()) < STALE_MS;
-  if (h && hrMs.load() != lastHrTick) {
-    int value = hrValue.load();
-    hrSmoothed = hrSmoothed < 0 ? value : 0.3f * value + 0.7f * hrSmoothed;
-    lastHrTick = hrMs.load();
+  cyclingPaused = false;
+  clearPower();
+  powerSmoothed = -1;
+  if (!cycling() && clients[1]) {
+    NimBLEDevice::deleteClient(clients[1]);
+    clients[1] = nullptr;
   }
-  if (p && powerMs.load() != lastPowerTick) {
-    int value = powerValue.load();
+  if ((!isConnected(0) && !preferred[0].address.isEmpty()) ||
+      (cycling() && !isConnected(1) && !preferred[1].address.isEmpty())) {
+    startScan(true);
+  }
+}
+
+void fanRequest(int button) {
+  lastButton = button;
+  lastAttempt = millis();
+  const bool simulate = !FanRadio::ready();
+  if (!simulate && !FanRadio::send(button)) return;
+
+  pendingLevel = -1;
+  if (button > 0) {
+    requestedLevel = button;
+  } else if (requestedLevel >= 0) {
+    requestedLevel = requestedLevel == 0 ? 1 : 0;
+  }
+  Serial.printf("%s button %d, target %d\n", simulate ? "Simulated" : "Sent",
+                button, requestedLevel);
+}
+
+void updateCooling() {
+  const PowerSample power = readPower();
+  const uint32_t hrTick = hrMs.load();
+  const uint32_t now = millis();
+  const bool h = isConnected(0) && hrTick && now - hrTick < STALE_MS;
+  const bool p = cycling() && isConnected(1) && power.fresh(now, STALE_MS);
+  if (!h) {
+    hrSmoothed = -1;
+  } else if (hrSmoothed < 0 || hrTick != lastHrTick) {
+    const int value = hrValue.load();
+    hrSmoothed = hrSmoothed < 0 ? value : 0.3f * value + 0.7f * hrSmoothed;
+    lastHrTick = hrTick;
+  }
+  if (!p) {
+    powerSmoothed = -1;
+  } else if (powerSmoothed < 0 || power.timestamp != lastPowerTick) {
+    const int value = max(0, power.watts);
     powerSmoothed = powerSmoothed < 0 ? value : 0.3f * value + 0.7f * powerSmoothed;
-    lastPowerTick = powerMs.load();
+    lastPowerTick = power.timestamp;
   }
   if (mode == Mode::Manual) return;
-  int a = h ? CoolingMath::stage(hrSmoothed, hrStage2(), hrStage3(), HR_HYST, requestedLevel) : -1;
-  int b = p ? CoolingMath::stage(powerSmoothed, powerStage2(), powerStage3(), PWR_HYST, requestedLevel) : -1;
-  int desired = -1;
-  if (mode == Mode::HR) desired = a;
-  if (mode == Mode::Power) desired = b;
-  if (mode == Mode::Adaptive) desired = max(a, b);
+
+  const bool canSend = lastButton < 0 || now - lastAttempt >= MIN_SWITCH_MS;
+  if (cycling() && cooling.zeroOffSeconds > 0) {
+    if (p && power.watts > 0) cyclingPaused = false;
+    if (p && power.zeroFor(now, cooling.zeroOffSeconds * 1000UL, STALE_MS)) {
+      cyclingPaused = true;
+    }
+    if (cyclingPaused || (p && power.watts == 0 && requestedLevel <= 0)) {
+      pendingLevel = -1;
+      if (cyclingPaused && requestedLevel > 0 && (lastButton != 0 || canSend)) fanRequest(0);
+      return;
+    }
+  }
+
+  const int hrDemand = h ? CoolingMath::stage(hrSmoothed, hrStage2(), hrStage3(),
+                                              HR_HYST, requestedLevel) : -1;
+  const int powerDemand = p ? CoolingMath::stage(powerSmoothed, powerStage2(), powerStage3(),
+                                                 PWR_HYST, requestedLevel) : -1;
+  int desired = hrDemand;
+  if (cycling() && mode == Mode::Power) desired = powerDemand;
+  if (cycling() && mode == Mode::Adaptive) desired = max(hrDemand, powerDemand);
   if (desired < 1 || desired == requestedLevel) { pendingLevel = -1; return; }
   if (pendingLevel != desired) { pendingLevel = desired; pendingSince = now; }
-  if ((uint32_t)(now - lastSwitch) < MIN_SWITCH_MS) return;
-  if (desired > requestedLevel || (uint32_t)(now - pendingSince) >= DOWN_HOLD_MS) {
+  if ((canSend || (requestedLevel == 0 && lastButton == 0)) &&
+      (desired > requestedLevel || now - pendingSince >= DOWN_HOLD_MS)) {
     fanRequest(desired);
   }
 }
@@ -446,21 +485,31 @@ String compact(String s, int maxChars) {
   return s.substring(0, maxChars - 1) + "~";
 }
 void drawHome() {
-  auto& d = M5Cardputer.Display;
-  uint32_t now = millis();
-  bool h = hrMs.load() && uint32_t(now - hrMs.load()) < STALE_MS;
-  bool p = powerMs.load() && uint32_t(now - powerMs.load()) < STALE_MS;
-  line(2, "CARDIO54  ADV - V0.2", TFT_CYAN);
-  line(19, String("HR    ") + (h ? String(hrValue.load()) + " bpm" : "-- bpm") +
+  const PowerSample power = readPower();
+  const uint32_t hrTick = hrMs.load();
+  const uint32_t now = millis();
+  const bool h = isConnected(0) && hrTick && now - hrTick < STALE_MS;
+  const bool p = cycling() && isConnected(1) && power.fresh(now, STALE_MS);
+  line(2, cycling() ? "CARDIO54 / INDOOR CYCLING" : "CARDIO54 / TREADMILL RUN", TFT_CYAN);
+  line(16, String("HR    ") + (h ? String(hrValue.load()) + " bpm" : "-- bpm") +
        (isConnected(0) ? "  [BLE]" : "  [--]"));
-  line(35, String("POWER ") + (p ? String(powerValue.load()) + " W" : "-- W") +
-       (isConnected(1) ? "  [BLE]" : "  [--]"));
-  line(52, String("MODE: ") + modeName() + "  TARGET: " + requestedLevel + "/3", TFT_GREEN);
-  line(68, "RF OUTPUT: DISABLED (test)", TFT_YELLOW);
-  line(82, "HR " + String(hrStage2()) + "/" + hrStage3() +
-       " bpm   PWR " + powerStage2() + "/" + powerStage3() + "W", TFT_LIGHTGREY);
-  line(103, "S:SETTINGS Z:ZONES B:BLE T:TEST", TFT_WHITE);
-  line(119, "A/H/P:MODE  1/2/3:MAN R:BLE", TFT_WHITE);
+  if (cycling()) {
+    line(29, String("POWER ") + (p ? String(power.watts) + " W" : "-- W") +
+         (isConnected(1) ? "  [BLE]" : "  [--]"));
+  }
+  const String target = requestedLevel < 0 ? "?" :
+                        requestedLevel == 0 ? "OFF" : String(requestedLevel) + "/3";
+  line(43, String(modeName()) + "  TARGET: " + target, TFT_GREEN);
+  line(57, FanRadio::status(), TFT_YELLOW);
+  line(71, String("HR ") + hrStage2() + "/" + hrStage3() + " bpm" +
+       (cycling() ? String("  PWR ") + powerStage2() + "/" + powerStage3() + "W"
+                  : String("")), TFT_LIGHTGREY);
+  if (cycling() && mode != Mode::Manual && cyclingPaused && cooling.zeroOffSeconds > 0) {
+    line(85, "Paused - pedal to resume", TFT_YELLOW);
+  }
+  line(98, "M:ACTIVITY S:SETTINGS Z:ZONES");
+  line(111, "B:BLE T:TEST R:RECONNECT");
+  line(124, cycling() ? "A/H/P:MODE 0:POWER 1/2/3:FAN" : "A/H:HR 0:POWER 1/2/3:FAN");
 }
 void drawBrowser() {
   FoundDevice snapshot[MAX_DEVICES];
@@ -482,38 +531,44 @@ void drawBrowser() {
     line(y, String(listIndex == selected ? ">" : " ") + compact(name, 24) + " " + dev.rssi + "dB", color);
     line(y + 10, String(" ") + dev.address, TFT_DARKGREY);
   }
-  line(106, String(nFiltered) + "/" + n + " found   TAB:HR/PWR   ENT:pair", TFT_WHITE);
+  line(106, String(nFiltered) + "/" + n + (cycling() ? " found  TAB:HR/PWR  ENT:pair" : " found  ENTER:pair"), TFT_WHITE);
   line(119, "Fn+;/. scroll  Fn+Ent scan", TFT_WHITE);
 }
 void drawTest() {
-  uint32_t now = millis();
+  const PowerSample power = readPower();
+  const uint32_t hrTick = hrMs.load();
+  const uint32_t now = millis();
+  bool anyFresh = false;
   line(2, "BLE SENSOR TEST", TFT_CYAN);
-  for (int i = 0; i < 2; ++i) {
+  for (int i = 0; i < (cycling() ? 2 : 1); ++i) {
     int y = i == 0 ? 18 : 65;
     bool connected = isConnected(i);
-    uint32_t tick = i == 0 ? hrMs.load() : powerMs.load();
-    bool fresh = tick && (uint32_t)(now - tick) < STALE_MS;
+    bool fresh = connected && (i == 0 ? hrTick && now - hrTick < STALE_MS
+                                       : power.fresh(now, STALE_MS));
+    anyFresh |= fresh;
     line(y, String(i == 0 ? "HR: " : "PWR: ") + (connected ? "CONNECTED" : "DISCONNECTED"),
          connected ? TFT_GREEN : TFT_YELLOW);
     String label = preferred[i].name.isEmpty() ? "(not saved)" : preferred[i].name;
     line(y + 12, compact(label, 36), TFT_LIGHTGREY);
-    String val = fresh ? String(i == 0 ? hrValue.load() : powerValue.load()) : "WAITING";
+    String val = fresh ? String(i == 0 ? hrValue.load() : power.watts) : "WAITING";
     line(y + 24, String(i == 0 ? "Heart rate: " : "Power: ") + val + (fresh ? (i == 0 ? " bpm" : " W") : ""));
   }
-  bool anyFresh = (hrMs.load() && uint32_t(now - hrMs.load()) < STALE_MS) ||
-                  (powerMs.load() && uint32_t(now - powerMs.load()) < STALE_MS);
   line(109, anyFresh ? "Receiving sensor data" : compact(statusText, 36), TFT_YELLOW);
   line(123, "ESC HOME  TAB BLE BROWSER", TFT_WHITE);
 }
 void drawSettings() {
-  line(2, "SETTINGS  (stored in flash)", TFT_CYAN);
+  line(2, cycling() ? "CYCLING SETTINGS" : "TREADMILL SETTINGS", TFT_CYAN);
   int first = (settingsSelected / 5) * 5;
-  for (int row = 0; row < 5 && (first + row) < SETTINGS_FIELDS; ++row) {
+  for (int row = 0; row < 5 && (first + row) < settingsCount(); ++row) {
     int i = first + row;
-    String value = (editingSetting && i == settingsSelected) ? editBuffer + "_" : String(getSetting(i));
-    String suffix = (i == 0 || i == 1) ? " bpm" : (i == 2 ? " W" : "%");
+    const Setting& setting = settingAt(i);
+    const uint16_t current = cooling.*(setting.value);
+    String value = (editingSetting && i == settingsSelected) ? editBuffer + "_" : String(current);
+    if (setting.value == &CoolingConfig::zeroOffSeconds && current == 0 &&
+        !(editingSetting && i == settingsSelected)) value = "Disabled";
+    else value += setting.unit;
     line(19 + row * 17, String(i == settingsSelected ? ">" : " ") +
-         settingLabels[i] + ": " + value + suffix,
+         setting.label + ": " + value,
          i == settingsSelected ? TFT_GREEN : TFT_WHITE);
   }
   line(109, compact(settingsNotice, 38), TFT_YELLOW);
@@ -521,24 +576,25 @@ void drawSettings() {
 }
 
 void drawZones() {
-  line(2, "CYCLING ZONES (% HRR)", TFT_CYAN);
+  line(2, cycling() ? "CYCLING ZONES (% HRR)" : "RUNNING ZONES (% HRR)", TFT_CYAN);
   const int pct[] = {34, 47, 60, 73, 87, 100};
   const char* labels[] = {"Z1", "Z2", "Z3", "Z4", "Z5"};
   for (int i = 0; i < 5; ++i) {
-    int start = CoolingMath::hrAtPercent(cooling.restingHr, cooling.maxHr, pct[i]);
-    int end = CoolingMath::hrAtPercent(cooling.restingHr, cooling.maxHr, pct[i+1]) - 1;
-    if (i == 4) end = cooling.maxHr;
+    int start = CoolingMath::hrAtPercent(cooling.restingHr, activeMaxHr(), pct[i]);
+    int end = CoolingMath::hrAtPercent(cooling.restingHr, activeMaxHr(), pct[i+1]) - 1;
+    if (i == 4) end = activeMaxHr();
     line(17 + 15*i, String(labels[i]) + ": " + pct[i] + "-" + pct[i+1] +
          "% = " + start + "-" + end + " bpm", TFT_WHITE);
   }
   line(96, "FAN: HR " + String(hrStage2()) + "/" + hrStage3() + " bpm", TFT_GREEN);
-  line(109, "FAN: PWR " + String(powerStage2()) + "/" + powerStage3() + " W", TFT_GREEN);
+  if (cycling()) line(109, "FAN: PWR " + String(powerStage2()) + "/" + powerStage3() + " W", TFT_GREEN);
   line(122, "S:SETTINGS   ESC:HOME", TFT_WHITE);
 }
 
 void settingsEnter() {
+  const Setting& setting = settingAt(settingsSelected);
   if (!editingSetting) {
-    editBuffer = String(getSetting(settingsSelected));
+    editBuffer = String(cooling.*(setting.value));
     editingSetting = true;
     replaceOnNextDigit = true;
     settingsNotice = "Type to replace, ENTER saves";
@@ -549,18 +605,22 @@ void settingsEnter() {
     return;
   }
   long number = editBuffer.toInt();
-  if (number < 1 || number > 1000) {
+  if (number < 0 || number > 1000) {
     settingsNotice = "Value out of range";
     return;
   }
   CoolingConfig proposed = cooling;
-  setSetting(proposed, settingsSelected, static_cast<uint16_t>(number));
+  proposed.*(setting.value) = static_cast<uint16_t>(number);
   if (!validConfig(proposed)) {
     settingsNotice = "Invalid values or order";
     return;
   }
+  if (prefs.putUShort(setting.key, proposed.*(setting.value)) != sizeof(uint16_t)) {
+    settingsNotice = "Could not save settings";
+    return;
+  }
+  if (cooling.zeroOffSeconds != proposed.zeroOffSeconds) cyclingPaused = false;
   cooling = proposed;
-  saveCooling();
   pendingLevel = -1;  // recompute using the updated thresholds
   editingSetting = false;
   settingsNotice = "Saved. Thresholds updated";
@@ -624,7 +684,7 @@ void processKeyboard() {
       return;
     }
     if (keys.up) { settingsSelected = max(0, settingsSelected-1); return; }
-    if (keys.down) { settingsSelected = min(SETTINGS_FIELDS-1, settingsSelected+1); return; }
+    if (keys.down) { settingsSelected = min(settingsCount()-1, settingsSelected+1); return; }
     if (keys.enter) { settingsEnter(); return; }
     for (char ch : keys.word) {
       if (ch == 'z' || ch == 'Z') { screen = Screen::Zones; return; }
@@ -641,7 +701,7 @@ void processKeyboard() {
   if (keys.esc) { screen = Screen::Home; return; }
 
   if (screen == Screen::Browser) {
-    if (keys.tab) { targetSensor ^= 1; selected = 0; return; }
+    if (keys.tab && cycling()) { targetSensor ^= 1; selected = 0; return; }
     if (keys.up)   { selected = max(0, selected - 1); return; }
     if (keys.down) { selected++; return; }
     if (keys.fn && keys.enter) { startScan(false); return; }
@@ -683,13 +743,16 @@ void processKeyboard() {
       case 'z': case 'Z': screen = Screen::Zones; return;
       case 'r': case 'R':
         startScan(true); return;
-      case 'a': case 'A': mode = Mode::Adaptive; pendingLevel = -1; break;
+      case 'm': case 'M': switchActivity(); return;
+      case 'a': case 'A': mode = cycling() ? Mode::Adaptive : Mode::HR; pendingLevel = -1; return;
       case 'h': case 'H': mode = Mode::HR; pendingLevel = -1; break;
-      case 'p': case 'P': mode = Mode::Power; pendingLevel = -1; break;
-      case '1': case '2': case '3':
+      case 'p': case 'P':
+        if (cycling()) { mode = Mode::Power; pendingLevel = -1; }
+        return;
+      case '0': case '1': case '2': case '3':
         mode = Mode::Manual;
         fanRequest(ch - '0');
-        break;
+        return;
     }
   }
 }
@@ -701,6 +764,8 @@ void setup() {
   M5Cardputer.Display.setRotation(0);
   loadPreferred();
   loadCooling();
+  if (!cycling()) mode = Mode::HR;
+  FanRadio::begin();
   NimBLEDevice::init("Cardio54-Controller");
   NimBLEScan* scan = NimBLEDevice::getScan();
   scan->setScanCallbacks(&browserCallbacks, false);
@@ -708,7 +773,7 @@ void setup() {
   scan->setInterval(100);
   scan->setWindow(80);
   scan->setMaxResults(0);  // callbacks populate our own bounded list
-  if (!preferred[0].address.isEmpty() || !preferred[1].address.isEmpty()) {
+  if (!preferred[0].address.isEmpty() || (cycling() && !preferred[1].address.isEmpty())) {
     startScan(true);  // restore saved selections when available
   }
   drawUI();
