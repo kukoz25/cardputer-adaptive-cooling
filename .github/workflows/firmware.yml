@@ -20,6 +20,10 @@ jobs:
           python-version: '3.11'
       - name: Install PlatformIO
         run: python -m pip install --upgrade platformio
+      - name: Test cooling logic
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror -I include tests/test_cooling_math.cpp -o /tmp/cardio-test
+          /tmp/cardio-test
       - name: Build for Cardputer-Adv
         run: pio run -e cardputer_adv
       - name: Prepare firmware file

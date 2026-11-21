@@ -6,6 +6,7 @@
 #include "cooling_math.h"
 #include "fan_radio.h"
 #include "zero_power.h"
+#include "treadmill_auto_off.h"
 #include <atomic>
 #include <string>
 #include <cstring>
@@ -126,6 +127,8 @@ struct CoolingConfig {
   uint16_t runMaxHr = 199;
   uint16_t runHr2Pct = 54;
   uint16_t runHr3Pct = 74;
+  uint16_t runStopHr = 100;
+  uint16_t runOffSeconds = 20;
 };
 CoolingConfig cooling;
 
@@ -151,7 +154,8 @@ bool validConfig(const CoolingConfig& c) {
          validHrProfile(c.restingHr, c.runMaxHr, c.runHr2Pct, c.runHr3Pct) &&
          c.ftp >= 50 && c.ftp <= 600 && c.pw2Pct >= 20 &&
          c.pw3Pct <= 200 && c.pw2Pct + 5 <= c.pw3Pct &&
-         c.zeroOffSeconds <= 600 && c.downshiftSeconds <= 600;
+         c.zeroOffSeconds <= 600 && c.downshiftSeconds <= 600 &&
+         c.runStopHr >= 30 && c.runStopHr <= c.runMaxHr && c.runOffSeconds <= 600;
 }
 
 struct Setting {
@@ -173,9 +177,11 @@ constexpr Setting settings[] = {
   {"runmaxhr", "Run max HR", " bpm", &CoolingConfig::runMaxHr},
   {"runhr2pct", "Run fan 2 HRR", "%", &CoolingConfig::runHr2Pct},
   {"runhr3pct", "Run fan 3 HRR", "%", &CoolingConfig::runHr3Pct},
+  {"runstophr", "Stop below HR", " bpm", &CoolingConfig::runStopHr},
+  {"runoff", "Run auto-off", " s", &CoolingConfig::runOffSeconds},
 };
 constexpr int CyclingSettingCount = 9;
-constexpr int TreadmillSettings[] = {0, 9, 10, 11, 8};
+constexpr int TreadmillSettings[] = {0, 9, 10, 11, 12, 13, 8};
 
 int settingsCount() {
   return cycling() ? CyclingSettingCount : sizeof(TreadmillSettings) / sizeof(int);
@@ -210,6 +216,7 @@ int selected = 0;
 String statusText = "Ready. B = scan BLE";
 int requestedLevel = -1;  // The fan provides no feedback.
 bool cyclingPaused = false;
+TreadmillAutoOff treadmillOff;
 int lastButton = -1;
 uint32_t lastAttempt = 0;
 int pendingLevel = -1;
@@ -387,6 +394,7 @@ void switchActivity() {
   targetSensor = 0;
   pendingLevel = -1;
   cyclingPaused = false;
+  treadmillOff.reset();
   clearPower();
   powerSmoothed = -1;
   if (!cycling() && clients[1]) {
@@ -435,9 +443,21 @@ void updateCooling() {
     powerSmoothed = powerSmoothed < 0 ? value : 0.3f * value + 0.7f * powerSmoothed;
     lastPowerTick = power.timestamp;
   }
-  if (mode == Mode::Manual) return;
+  if (mode == Mode::Manual) {
+    treadmillOff.reset();
+    return;
+  }
 
   const bool canSend = lastButton < 0 || now - lastAttempt >= MIN_SWITCH_MS;
+  const bool stopRunningFan = treadmillOff.update(
+      !cycling() && cooling.runOffSeconds > 0, h, hrValue.load(),
+      cooling.runStopHr, now, cooling.runOffSeconds * 1000UL);
+  if (treadmillOff.waiting() && (stopRunningFan || requestedLevel <= 0)) {
+    pendingLevel = -1;
+    // Power is a toggle: send it only while our target is known to be on.
+    if (stopRunningFan && requestedLevel > 0 && (lastButton != 0 || canSend)) fanRequest(0);
+    return;
+  }
   if (cycling() && cooling.zeroOffSeconds > 0) {
     if (p && power.watts > 0) cyclingPaused = false;
     if (p && power.zeroFor(now, cooling.zeroOffSeconds * 1000UL, STALE_MS)) {
@@ -508,6 +528,8 @@ void drawHome() {
                   : String("")), TFT_LIGHTGREY);
   if (cycling() && mode != Mode::Manual && cyclingPaused && cooling.zeroOffSeconds > 0) {
     line(85, "Paused - pedal to resume", TFT_YELLOW);
+  } else if (!cycling() && mode != Mode::Manual && treadmillOff.waiting()) {
+    line(85, requestedLevel == 0 ? "Paused - waiting for HR" : "Low/no HR - auto-off pending", TFT_YELLOW);
   }
   line(98, "M:ACTIVITY S:SETTINGS Z:ZONES");
   line(111, "B:BLE T:TEST R:RECONNECT");
@@ -566,7 +588,8 @@ void drawSettings() {
     const Setting& setting = settingAt(i);
     const uint16_t current = cooling.*(setting.value);
     String value = (editingSetting && i == settingsSelected) ? editBuffer + "_" : String(current);
-    if (setting.value == &CoolingConfig::zeroOffSeconds && current == 0 &&
+    if ((setting.value == &CoolingConfig::zeroOffSeconds ||
+         setting.value == &CoolingConfig::runOffSeconds) && current == 0 &&
         !(editingSetting && i == settingsSelected)) value = "Disabled";
     else value += setting.unit;
     line(19 + row * 17, String(i == settingsSelected ? ">" : " ") +
@@ -622,6 +645,8 @@ void settingsEnter() {
     return;
   }
   if (cooling.zeroOffSeconds != proposed.zeroOffSeconds) cyclingPaused = false;
+  if (cooling.runStopHr != proposed.runStopHr ||
+      cooling.runOffSeconds != proposed.runOffSeconds) treadmillOff.reset();
   cooling = proposed;
   pendingLevel = -1;  // recompute using the updated thresholds
   editingSetting = false;

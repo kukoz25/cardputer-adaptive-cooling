@@ -1,6 +1,64 @@
 #include <cassert>
 #include "cooling_math.h"
 #include "zero_power.h"
+#include "treadmill_auto_off.h"
+
+static void testTreadmillAutoOff() {
+  TreadmillAutoOff timer;
+  constexpr uint32_t duration = 20000;
+  constexpr int threshold = 100;
+  assert(!timer.waiting());
+  assert(!timer.update(true, true, 140, threshold, 0, duration));
+  assert(!timer.waiting());
+
+  // Low HR must last the entire delay, including the exact boundary.
+  assert(!timer.update(true, true, 99, threshold, 1000, duration));
+  assert(timer.waiting());
+  assert(!timer.update(true, true, 90, threshold, 20999, duration));
+  assert(timer.update(true, true, 90, threshold, 21000, duration));
+  assert(timer.update(true, true, 90, threshold, 22000, duration));
+
+  // At-threshold recovery resumes cooling and cancels a previous pause.
+  assert(!timer.update(true, true, 100, threshold, 23000, duration));
+  assert(!timer.waiting());
+
+  // No HR counts even if the last remembered value was high.
+  assert(!timer.update(true, false, 140, threshold, 24000, duration));
+  assert(!timer.update(true, false, 140, threshold, 43999, duration));
+  assert(timer.update(true, false, 140, threshold, 44000, duration));
+  assert(!timer.update(true, true, 140, threshold, 45000, duration));
+
+  // Recovery before expiry starts a new full countdown on the next drop.
+  assert(!timer.update(true, true, 90, threshold, 46000, duration));
+  assert(!timer.update(true, true, 120, threshold, 65000, duration));
+  assert(!timer.update(true, true, 90, threshold, 66000, duration));
+  assert(!timer.update(true, true, 90, threshold, 85999, duration));
+  assert(timer.update(true, true, 90, threshold, 86000, duration));
+
+  // Manual mode / cycling disables and resets the timer.
+  assert(!timer.update(false, false, -1, threshold, 87000, duration));
+  assert(!timer.waiting());
+  assert(!timer.update(true, false, -1, threshold, 88000, duration));
+  assert(!timer.update(true, false, -1, threshold, 107999, duration));
+  assert(timer.update(true, false, -1, threshold, 108000, duration));
+
+  // A zero delay disables auto-off rather than stopping immediately.
+  assert(!timer.update(true, true, 90, threshold, 109000, 0));
+  assert(!timer.waiting());
+
+  // Low and missing HR share one continuous countdown.
+  assert(!timer.update(true, true, 90, threshold, 110000, duration));
+  assert(!timer.update(true, false, 90, threshold, 120000, duration));
+  assert(timer.update(true, true, 90, threshold, 130000, duration));
+  timer.reset();
+  assert(!timer.waiting());
+
+  // Unsigned elapsed time remains valid across millis() rollover.
+  constexpr uint32_t start = UINT32_MAX - 10000;
+  assert(!timer.update(true, false, -1, threshold, start, duration));
+  assert(!timer.update(true, false, -1, threshold, start + duration - 1, duration));
+  assert(timer.update(true, false, -1, threshold, start + duration, duration));
+}
 static void testZeroPower() {
   PowerSample power;
   constexpr uint32_t maxGap = 7000;
@@ -35,6 +93,7 @@ static void testZeroPower() {
 
 int main() {
   testZeroPower();
+  testTreadmillAutoOff();
   assert(CoolingMath::hrAtPercent(49, 199, 54) == 130);
   assert(CoolingMath::hrAtPercent(49, 199, 74) == 160);
   assert(CoolingMath::powerAtPercent(228, 60) == 137);

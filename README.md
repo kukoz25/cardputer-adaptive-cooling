@@ -40,6 +40,17 @@ In automatic cycling modes, the app turns off a fan it has started once the trai
 
 Set `Stop at 0 W` in Cycling Settings to change the delay. Enter `0` to disable it. A longer delay can keep the fan running during stationary recovery intervals.
 
+### Auto-off during treadmill running
+
+In automatic treadmill mode, the app turns off a fan it has started when HR stays below `Stop below HR` or HR readings are unavailable for `Run auto-off` seconds. A valid reading at or above the threshold cancels the countdown and resumes cooling. Switching between low HR and missing readings keeps the countdown running. The fan stays off while waiting for a qualifying HR reading, including at startup.
+
+Open Treadmill Settings (`M` to select treadmill, then `S`) to set:
+
+- `Stop below HR`: the low-HR threshold, in bpm (default 100).
+- `Run auto-off`: the delay for low or missing HR, from 1 to 600 seconds (default 20). Enter `0` to disable treadmill auto-off.
+
+A BLE disconnect starts the countdown when detected. If BLE stays connected but measurements stop, readings become unavailable after 7 seconds without a valid HR measurement, then the configured countdown begins. The countdown resets in manual mode, when switching activities, or when changing either auto-off setting. Settings are saved across restarts.
+
 ## Keyboard
 
 | Screen | Key | Action |
